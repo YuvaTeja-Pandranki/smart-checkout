@@ -1,0 +1,124 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Smart Order Fulfillment — Serverless Checkout Service
+  Lambda + API Gateway + DynamoDB (idempotent checkout)
+
+# ── Global defaults applied to all Lambda functions ──────────────────────────
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 29          # API Gateway max timeout is 30s; keep Lambda just under
+    MemorySize: 256
+    Environment:
+      Variables:
+        ORDERS_TABLE_NAME: !Ref OrdersTable
+        AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1"   # Reuse HTTP connections to DynamoDB
+
+# ── Parameters (override at deploy time) ─────────────────────────────────────
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment stage name
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Lambda Function ──────────────────────────────────────────────────────────
+  CheckoutFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "smart-checkout-${StageName}"
+      Description: "Processes e-commerce checkouts — validates cart, calculates server price, creates order, captures payment"
+      Handler: checkout.handler
+      CodeUri: .
+      # IAM role — least privilege (SPEC.md §9.6): only the three operations the handler uses
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt OrdersTable.Arn
+      Events:
+        CheckoutApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CheckoutApi
+            Method: POST
+            Path: /checkout
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: "es2020"
+        Sourcemap: true
+        EntryPoints:
+          - src/handlers/checkout.ts
+
+  # ── API Gateway (HTTP API v2) ─────────────────────────────────────────────────
+  CheckoutApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      Description: "Smart Checkout API"
+      CorsConfiguration:
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowOrigins:
+          - "*"
+
+  # ── DynamoDB Table ────────────────────────────────────────────────────────────
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "checkout-orders-${StageName}"
+      BillingMode: PAY_PER_REQUEST    # Serverless — no capacity planning needed
+      TableClass: STANDARD
+      # Primary key — cartId is the idempotency key (SPEC.md §5 and §6)
+      AttributeDefinitions:
+        - AttributeName: cartId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: cartId
+          KeyType: HASH
+      # TTL — auto-delete old orders after 90 days (SPEC.md §6)
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      # Point-in-time recovery — enables restore to any second in the last 35 days
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: smart-checkout
+        - Key: Stage
+          Value: !Ref StageName
+
+# ── Outputs (shown after deploy) ─────────────────────────────────────────────
+Outputs:
+  CheckoutApiUrl:
+    Description: "POST to this URL to submit a checkout"
+    Value: !Sub "https://${CheckoutApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/checkout"
+    Export:
+      Name: !Sub "smart-checkout-${StageName}-api-url"
+
+  CheckoutFunctionArn:
+    Description: "Lambda function ARN"
+    Value: !GetAtt CheckoutFunction.Arn
+
+  OrdersTableName:
+    Description: "DynamoDB table name"
+    Value: !Ref OrdersTable
+
+  OrdersTableArn:
+    Description: "DynamoDB table ARN"
+    Value: !GetAtt OrdersTable.Arn
